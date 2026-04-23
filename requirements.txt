@@ -2,6 +2,7 @@ streamlit
 torch
 torchvision
 transformers
+huggingface_hub
 Pillow
 pandas
 open-clip-torch
