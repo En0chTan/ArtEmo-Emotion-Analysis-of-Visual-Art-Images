@@ -4,3 +4,9 @@ torchvision
 transformers
 Pillow
 pandas
+open-clip-torch
+plotly
+numpy
+scikit-learn
+nltk
+tqdm
