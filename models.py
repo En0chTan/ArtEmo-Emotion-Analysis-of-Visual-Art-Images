@@ -12,8 +12,6 @@ EMOTIONS = [
     "Anger", "Disgust", "Contentment", "Excitement", "Something Else"
 ]
 
-# One descriptive prompt per emotion — more specific prompts give better
-# CLIP similarity scores than bare emotion labels alone
 EMOTION_PROMPTS = {
     "Awe":          "This artwork evokes a profound sense of awe, wonder, and reverence.",
     "Amusement":    "This artwork feels joyful, playful, and amusing with lively energy.",
@@ -26,7 +24,6 @@ EMOTION_PROMPTS = {
     "Something Else": "This artwork evokes a complex, ambiguous, and hard-to-name emotion.",
 }
 
-# Affective captions — shown alongside the predicted emotion
 CAPTIONS = {
     "Awe":          "The expansive composition and dramatic lighting evoke a profound sense of awe and wonder — as if the viewer is confronted with something vast and transcendent.",
     "Amusement":    "The bright, contrasting colours and dynamic elements create a joyful, amusing atmosphere that invites lighthearted engagement.",
@@ -52,13 +49,50 @@ EMOTION_COLORS = {
 }
 
 
+# ── Safe CLIP embedding helpers ────────────────────────────────────────────────
+# These bypass get_image_features() / get_text_features() entirely and
+# call the sub-models directly, which works across all transformers versions.
+
+def _encode_image(model, processor, image: Image.Image, device: str):
+    """
+    Encodes a PIL image into a normalised CLIP embedding.
+    Uses model.vision_model + model.visual_projection directly to avoid
+    the BaseModelOutputWithPooling.norm attribute error in newer transformers.
+    """
+    inputs = processor(images=image, return_tensors="pt").to(device)
+    with torch.no_grad():
+        vision_outputs = model.vision_model(**inputs)
+        # pooler_output is the [CLS] token embedding — shape (1, hidden_size)
+        pooled = vision_outputs.pooler_output
+        # Project into shared CLIP embedding space
+        projected = model.visual_projection(pooled)
+    return F.normalize(projected, dim=-1)
+
+
+def _encode_texts(model, processor, texts: list, device: str):
+    """
+    Encodes a list of strings into normalised CLIP text embeddings.
+    Uses model.text_model + model.text_projection directly.
+    """
+    inputs = processor(
+        text=texts, return_tensors="pt",
+        padding=True, truncation=True, max_length=77
+    ).to(device)
+    with torch.no_grad():
+        text_outputs = model.text_model(**inputs)
+        # pooler_output is the [EOS] token embedding — shape (N, hidden_size)
+        pooled = text_outputs.pooler_output
+        projected = model.text_projection(pooled)
+    return F.normalize(projected, dim=-1)
+
+
 # ── Model loading ──────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner="Loading CLIP model…")
 def load_clip_model():
     """
     Loads CLIP ViT-B/32 from Hugging Face.
-    Cached so it only loads once per Streamlit session.
+    Cached so it only downloads and loads once per session.
     """
     device    = "cuda" if torch.cuda.is_available() else "cpu"
     model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
@@ -67,64 +101,51 @@ def load_clip_model():
     return model, processor, device
 
 
-# ── Feature extraction ─────────────────────────────────────────────────────────
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 def extract_image_features(image: Image.Image, model, processor, device):
     """
     Extracts and L2-normalises CLIP image embeddings.
-    Identical signature to original — existing callers unchanged.
+    Kept for backward compatibility with existing callers in app.py.
     """
     if image.mode != "RGB":
         image = image.convert("RGB")
-    inputs = processor(images=image, return_tensors="pt").to(device)
-    with torch.no_grad():
-        feats = model.get_image_features(**inputs)
-    return F.normalize(feats, dim=-1)
+    return _encode_image(model, processor, image, device)
 
-
-# ── Zero-shot emotion classification (replaces mock) ──────────────────────────
 
 def predict_emotions(image: Image.Image, model, processor, device):
     """
-    Real zero-shot emotion classification using CLIP similarity.
+    Zero-shot emotion classification using CLIP cosine similarity.
 
-    Encodes the image and all emotion text prompts into the shared
-    CLIP embedding space, then ranks emotions by cosine similarity.
-
-    Returns a sorted list of dicts:
+    Scores each of the 9 emotion prompts against the image embedding
+    and returns a sorted list of dicts:
         [{"emotion": str, "probability": float, "similarity": float}, ...]
-
-    No trained model required.
     """
     if image.mode != "RGB":
         image = image.convert("RGB")
 
-    # ── Image embedding ────────────────────────────────────────────────────
-    img_inputs = processor(images=image, return_tensors="pt").to(device)
-    with torch.no_grad():
-        img_feat = F.normalize(model.get_image_features(**img_inputs), dim=-1)
+    # Image embedding — (1, D)
+    img_feat = _encode_image(model, processor, image, device)
 
-    # ── Text embeddings for all emotion prompts ────────────────────────────
-    prompts    = list(EMOTION_PROMPTS.values())
-    txt_inputs = processor(
-        text=prompts, return_tensors="pt",
-        padding=True, truncation=True
-    ).to(device)
-    with torch.no_grad():
-        txt_feats = F.normalize(model.get_text_features(**txt_inputs), dim=-1)
+    # Text embeddings — (9, D)
+    prompts   = list(EMOTION_PROMPTS.values())
+    txt_feats = _encode_texts(model, processor, prompts, device)
 
-    # ── Cosine similarities → softmax probabilities ────────────────────────
-    # Temperature scaling (logit_scale) sharpens the distribution
+    # Cosine similarities — (9,)
+    sims = (img_feat @ txt_feats.T).squeeze(0)
+
+    # Temperature-scaled softmax → probabilities
+    # Dividing by 10 softens the distribution so minority emotions
+    # don't collapse to near-zero probability
     logit_scale = model.logit_scale.exp().item()
-    sims        = (img_feat @ txt_feats.T).squeeze(0)          # (9,)
-    probs       = F.softmax(sims * logit_scale / 10, dim=0)    # (9,)
+    probs = F.softmax(sims * logit_scale / 10, dim=0)
 
-    sims_np  = sims.cpu().numpy()
-    probs_np = probs.cpu().numpy()
+    sims_np  = sims.cpu().float().numpy()
+    probs_np = probs.cpu().float().numpy()
 
     results = [
         {
-            "emotion":    emotion,
+            "emotion":     emotion,
             "probability": float(probs_np[i]),
             "similarity":  float(sims_np[i]),
         }
@@ -135,30 +156,23 @@ def predict_emotions(image: Image.Image, model, processor, device):
 
 
 def predict_emotions_mock(image_features):
-    """
-    Kept for backward compatibility.
-    Now returns a notice — use predict_emotions() for real results.
-    """
+    """Kept for backward compatibility — returns random probabilities."""
     import random
-    raw   = [random.random() for _ in EMOTIONS]
-    total = sum(raw)
+    raw    = [random.random() for _ in EMOTIONS]
+    total  = sum(raw)
     normed = [p / total for p in raw]
-    results = [{"emotion": e, "probability": p}
+    results = [{"emotion": e, "probability": p, "similarity": 0.0}
                for e, p in zip(EMOTIONS, normed)]
     results.sort(key=lambda x: x["probability"], reverse=True)
     return results
 
 
-# ── Caption generation ─────────────────────────────────────────────────────────
-
 def generate_caption(top_emotion: str, similarity: float):
     """
-    Returns an affective caption for the predicted emotion.
-    Includes a confidence qualifier based on the CLIP similarity score.
+    Returns (caption_str, qualifier_str) for the predicted emotion.
+    Qualifier reflects how strongly CLIP matched the emotion prompt.
     """
     base = CAPTIONS.get(top_emotion, CAPTIONS["Something Else"])
-
-    # Add a confidence qualifier so the user knows how certain CLIP is
     if similarity >= 0.28:
         qualifier = "strongly"
     elif similarity >= 0.22:
@@ -167,10 +181,9 @@ def generate_caption(top_emotion: str, similarity: float):
         qualifier = "subtly"
     else:
         qualifier = "faintly"
-
     return base, qualifier
 
 
-def generate_caption_mock(image_features, top_emotion):
+def generate_caption_mock(image_features, top_emotion: str):
     """Kept for backward compatibility."""
     return CAPTIONS.get(top_emotion, CAPTIONS["Something Else"])
