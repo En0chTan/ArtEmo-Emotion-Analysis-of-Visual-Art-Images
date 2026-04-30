@@ -350,25 +350,35 @@ def main():
                     </span>
                 </div>
                 """, unsafe_allow_html=True)
-
+                
                 with st.spinner("Loading CLIP… (first run only)"):
                     clip_model, processor, device = models.load_clip_model()
 
                 with st.spinner("Analysing emotional content…"):
-                    # Extract image features (kept for API compatibility)
                     features = models.extract_image_features(
+                    image, clip_model, processor, device
+                )
+
+                # Graceful fallback if models.py is the old version
+                if hasattr(models, 'predict_emotions'):
+                    results = models.predict_emotions(
                         image, clip_model, processor, device
                     )
+                else:
+                    results = models.predict_emotions_mock(features)
 
-                    # Real zero-shot classification
-                    results  = models.predict_emotions(
-                        image, clip_model, processor, device
-                    )
+                top_emotion = results[0]["emotion"]
+                top_prob    = results[0]["probability"]
+                top_sim     = results[0].get("similarity", 0.0)
 
-                top_emotion  = results[0]["emotion"]
-                top_prob     = results[0]["probability"]
-                top_sim      = results[0].get("similarity", 0.0)
-                caption, qualifier = models.generate_caption(top_emotion, top_sim)
+                # Graceful fallback for generate_caption too
+                if hasattr(models, 'generate_caption'):
+                    caption, qualifier = models.generate_caption(top_emotion, top_sim)
+                else:
+                    caption   = models.generate_caption_mock(features, top_emotion)
+                    qualifier = "subtly"
+
+
 
                 # Emotion hero card
                 color = models.EMOTION_COLORS.get(top_emotion, "#9ca3af")
