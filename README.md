@@ -1,4 +1,4 @@
-# ArtEmo AI 🎨
+# ArtEmo🎨
 ## Emotion-Aware Artwork Interpretation System
 
 An intelligent multimodal AI system that analyzes visual artworks, predicts evoked emotional responses, and generates affective captions describing the emotional interpretation of art.
